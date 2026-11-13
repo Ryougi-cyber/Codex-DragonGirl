@@ -18,7 +18,7 @@ const DASHBOARD_URL = 'dragon://app/src/renderer/dashboard.html';
 function codexWindowFrame(codexProcess) {
   const frame = followWindowFrame(codexProcess);
   if (frame && codexProcess.coordinateSpace === 'physical' && process.platform === 'win32')
-    return { ...frame, ...screen.screenToDipRect(null, frame) };
+    return { ...frame, ...screen.screenToDipRect(null, frame), nativeFrame: frame };
   return frame;
 }
 
@@ -49,7 +49,7 @@ export class Dashboard {
       refresh: () => void monitor.refreshAll().catch(() => {}),
       bubbleFor: (c) => this.bubbleFor(c),
       onDrag: (c) => this.onDrag(c),
-      stackWindows: (host, overlays, owned) => monitor.stackWindows(host, overlays, owned),
+      stackWindows: (host, overlays, owned, follow) => monitor.stackWindows(host, overlays, owned, follow),
       prayerWaveTarget: (c) => this.prayerWaveTarget(c),
       selectCharacter: (id) => this.selectCharacter(id),
     };

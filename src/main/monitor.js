@@ -118,14 +118,14 @@ export class Monitor extends EventEmitter {
     });
   }
   // 层级请求复用原生桥管道，编号由原生端再次核对所属进程；断线或背压时等下一份心跳重试。
-  stackWindows(host, overlays, owned) {
+  stackWindows(host, overlays, owned, follow) {
     const input = this.native?.stdin;
     const ids = [...overlays, ...owned].map(Number);
     if (this.stopped || !input?.writable || input.destroyed || input.writableLength > 16384
       || !Number.isSafeInteger(Number(host)) || Number(host) < 0 || !overlays.length
       || overlays.length > 256 || owned.length > 256
       || !ids.every((id) => Number.isSafeInteger(id) && id > 0)) return false;
-    input.write(JSON.stringify({ host: Number(host), overlays: overlays.map(Number), owned: owned.map(Number) }) + '\n', () => {});
+    input.write(JSON.stringify({ host: Number(host), overlays: overlays.map(Number), owned: owned.map(Number), follow }) + '\n', () => {});
     return true;
   }
   // 统一符号链接、盘符与目录大小写，迟到的桥接结果不能覆盖更新的窗口状态。

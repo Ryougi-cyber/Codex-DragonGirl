@@ -16,6 +16,95 @@ internal static class DragonBridge
     private static List<ProcessRow> processes = new List<ProcessRow>();
     private static DateTime discoveredAt = DateTime.MinValue;
     private static volatile bool inputClosed;
+    private static readonly AutoResetEvent geometryChanged = new AutoResetEvent(false);
+    private sealed class NativeBinding
+    {
+        internal IntPtr Host, Overlay;
+        internal int Owner, Dx, Dy, Width, Height;
+    }
+    private static readonly object bindingLock = new object();
+    private static readonly Dictionary<long, NativeBinding> bindings = new Dictionary<long, NativeBinding>();
+    private static void SyncNativeFollowers(IntPtr changed)
+    {
+        lock (bindingLock)
+        {
+            foreach (NativeBinding b in bindings.Values)
+            {
+                if (changed != IntPtr.Zero && changed != b.Host) continue;
+                uint owner; GetWindowThreadProcessId(b.Overlay, out owner);
+                Rect host, overlay;
+                if (owner != b.Owner || IsIconic(b.Host) || !IsWindowVisible(b.Host) || !IsWindowVisible(b.Overlay)
+                    || !GetWindowRect(b.Host, out host) || !GetWindowRect(b.Overlay, out overlay)) continue;
+                // Electron still owns resizing, DPI changes and layout constraints.
+                if (host.Right-host.Left != b.Width || host.Bottom-host.Top != b.Height) continue;
+                int x=host.Left+b.Dx, y=host.Top+b.Dy;
+                if (overlay.Left != x || overlay.Top != y)
+                    SetWindowPos(b.Overlay, IntPtr.Zero, x, y, 0, 0, 0x4015);
+            }
+        }
+    }
+    private static void UpdateNativeFollowers(Dictionary<string, object> request, int owner, IntPtr host, List<IntPtr> overlays)
+    {
+        object data;
+        if (!request.TryGetValue("follow", out data)) return;
+        object[] entries=data as object[];
+        if (entries == null || entries.Length>256) throw new ArgumentException();
+        var next=new List<NativeBinding>();
+        foreach (object item in entries)
+        {
+            var v=item as Dictionary<string,object>;
+            IntPtr overlay=new IntPtr(Convert.ToInt64(v["id"]));
+            if (!overlays.Contains(overlay) || host==IntPtr.Zero) throw new ArgumentException();
+            int dx=Convert.ToInt32(v["dx"]),dy=Convert.ToInt32(v["dy"]),w=Convert.ToInt32(v["width"]),h=Convert.ToInt32(v["height"]);
+            if (Math.Abs((long)dx)>100000 || Math.Abs((long)dy)>100000 || w<1 || h<1 || w>100000 || h>100000) throw new ArgumentException();
+            next.Add(new NativeBinding{Host=host,Overlay=overlay,Owner=owner,Dx=dx,Dy=dy,Width=w,Height=h});
+        }
+        lock(bindingLock)
+        {
+            foreach(IntPtr overlay in overlays) bindings.Remove(overlay.ToInt64());
+            foreach(NativeBinding b in next) bindings[b.Overlay.ToInt64()]=b;
+        }
+        SyncNativeFollowers(host);
+    }
+    private delegate void WinEventCallback(IntPtr hook, uint kind, IntPtr window, int objectId, int childId, uint thread, uint time);
+    private static readonly WinEventCallback geometryCallback = OnGeometryEvent;
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module, WinEventCallback callback, uint process, uint thread, uint flags);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWinEvent(IntPtr hook);
+
+    private static void OnGeometryEvent(IntPtr hook, uint kind, IntPtr window, int objectId, int childId, uint thread, uint time)
+    {
+        if (window == IntPtr.Zero || (kind == 0x800B && (objectId != 0 || childId != 0))) return;
+        uint owner;
+        GetWindowThreadProcessId(window, out owner);
+        // Discovery publishes a replacement list; callbacks never mutate it.
+        List<ProcessRow> known = processes;
+        if (kind == 3 || known.Exists(row => row.Pid == (int)owner))
+        {
+            SyncNativeFollowers(window);
+            geometryChanged.Set();
+        }
+    }
+
+    private static void StartGeometryEvents()
+    {
+        Thread events = new Thread(delegate()
+        {
+            IntPtr location = SetWinEventHook(0x800B, 0x800B, IntPtr.Zero, geometryCallback, 0, 0, 2);
+            IntPtr foreground = SetWinEventHook(3, 3, IntPtr.Zero, geometryCallback, 0, 0, 2);
+            try { System.Windows.Forms.Application.Run(); }
+            finally
+            {
+                if (location != IntPtr.Zero) UnhookWinEvent(location);
+                if (foreground != IntPtr.Zero) UnhookWinEvent(foreground);
+                GC.KeepAlive(geometryCallback);
+            }
+        });
+        events.IsBackground = true;
+        events.SetApartmentState(ApartmentState.STA);
+        events.Start();
+    }
 
     // 每个记录只保留识别和聚焦所需的信息，完整环境读取后立即释放。
     private sealed class ProcessRow
@@ -287,6 +376,7 @@ internal static class DragonBridge
         // 桌面模式的恢复命令也通过同一管道排队，覆盖模式切换前尚未执行的跟随请求。
         if (host == IntPtr.Zero)
         {
+            lock(bindingLock) foreach(IntPtr overlay in overlays) bindings.Remove(overlay.ToInt64());
             foreach (IntPtr window in overlays)
                 if (!IsTopmost(window)) SetWindowPos(window, new IntPtr(-1), 0, 0, 0, 0, flags);
             return;
@@ -294,6 +384,7 @@ internal static class DragonBridge
         uint hostPid;
         if (GetWindowThreadProcessId(host, out hostPid) == 0 || !IsWindowVisible(host) || IsIconic(host)) return;
         using (Process process = Process.GetProcessById((int)hostPid)) if (!IsTarget(process)) return;
+        UpdateNativeFollowers(request, owner, host, overlays);
         List<long> topmost;
         List<Dictionary<string, object>> normal;
         List<long> visible = WindowOrder(out topmost, out normal);
@@ -375,10 +466,12 @@ internal static class DragonBridge
             }
             else if (args.Length != 0) return 1;
             string previous = null;
+            StartGeometryEvents();
             // 排序可能被系统暂时拒绝且不报错；稳定状态每秒补发一次，松手后无需再移动其他窗口也能重试。
             Stopwatch heartbeat = Stopwatch.StartNew();
             while (!inputClosed)
             {
+                SyncNativeFollowers(IntPtr.Zero);
                 string current = Snapshot();
                 if (current != previous || heartbeat.ElapsedMilliseconds >= 1000)
                 {
@@ -387,7 +480,9 @@ internal static class DragonBridge
                     previous = current;
                     heartbeat.Restart();
                 }
-                Thread.Sleep(120);
+                // Wake on host movement; retain a 120ms fallback for missed events.
+                // Coalesce bursts to avoid queueing stale geometry snapshots.
+                geometryChanged.WaitOne(120);
             }
             return 0;
         }
