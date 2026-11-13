@@ -10,7 +10,7 @@ let command, args;
 // Windows 使用系统内置 .NET Framework 编译器，成品不依赖开发工具或 PowerShell 脚本。
 if (process.platform === 'win32') {
   command = path.join(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe');
-  args = ['/nologo', '/optimize+', '/target:exe', '/platform:x64', '/reference:System.Web.Extensions.dll',
+  args = ['/nologo', '/optimize+', '/target:exe', '/platform:x64', '/reference:System.Web.Extensions.dll', '/reference:System.Windows.Forms.dll',
     `/out:${path.join(root, 'native/bin/dragongirl-native.exe')}`, path.join(root, 'native/DragonBridge.cs')];
 } else if (process.platform === 'darwin') {
   command = '/usr/bin/xcrun';

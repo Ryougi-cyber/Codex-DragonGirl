@@ -23,11 +23,14 @@ finally { hook.deregister(); }
 const { screen, powerMonitor } = await import(electron);
 
 // 记录原生窗口收到的几何与可见性，便于检查两份宿主快照之间的状态。
+let nextWindowId = 100;
 function mockWindow(initialBounds) {
+  const windowId = nextWindowId++;
   let bounds = initialBounds, visible = false;
   return {
     loadURL: async () => {},
     isDestroyed: () => false,
+    getMediaSourceId: () => `window:${windowId}:0`,
     isVisible: () => visible,
     getBounds: () => bounds,
     setBounds: (next) => { bounds = next; },

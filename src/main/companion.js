@@ -241,6 +241,7 @@ export class Companion {
       const c = locate(event, 'character');
       if (c?.validPoint(point)) {
         c.gesture.begin(point, c.character);
+        c.clearNativeFollow();
         c.setInteractive('character', true);
       }
     });
@@ -352,7 +353,7 @@ export class Companion {
     // 菜单期间的后台状态更新不重复改动人物窗口；用户主动改大小或恢复位置时仍正常应用。
     const menuKeepsGeometry = this.contextMenu && this.menuCharacter
       && RECT_KEYS.every((key) => this.character[key] === this.menuCharacter[key]);
-    if (!menuKeepsGeometry) window.setBounds(stageBounds(this.character), false);
+    if (!menuKeepsGeometry && !this.nativeTranslation) window.setBounds(stageBounds(this.character), false);
     this.sendCharacterLayout();
     if (this.bubbleVisible) this.positionBubble();
     this.pollCursor(true);
@@ -611,7 +612,9 @@ export class Companion {
     const window = this.windows.get('bubble');
     const current = window.getBounds();
     // 原生窗口位置不变时不重复定位，避免在透明窗口上制造无意义的重绘与位置回跳。
-    if (['x', 'y', 'width', 'height'].some(key => current[key] !== layout.bounds[key]))
+    this.nativeBubbleBounds = layout.bounds;
+    if ((!this.nativeTranslation || current.width !== layout.bounds.width || current.height !== layout.bounds.height)
+      && ['x', 'y', 'width', 'height'].some(key => current[key] !== layout.bounds[key]))
       window.setBounds(layout.bounds, false);
     window.webContents.send('dg:bubble', this.bubbleModel);
   }
@@ -696,6 +699,7 @@ export class Companion {
     };
     this.menuCharacter = { ...this.character };
     this.contextMenu = menu;
+    this.clearNativeFollow();
     clearTimeout(this.cursorTimer);
     try {
       const bounds = window.getContentBounds();
@@ -911,6 +915,13 @@ export class Companion {
   }
 
   // 使用原生窗口编号直接调整相对层级，不截屏、不聚焦宿主，也不把后台角色提升到其他应用上方。
+  clearNativeFollow() {
+    this.nativeFollowHost = null;
+    if (process.platform !== 'win32') return;
+    const overlays = [...this.windows.values()].filter(w => !w.isDestroyed()).map(w => w.getMediaSourceId().split(':')[1]);
+    this.delegate?.stackWindows?.(this.followTarget?.id || 0, overlays, Companion.ownedWindowIds(), []);
+  }
+
   syncWindowStacking(force = false) {
     const hostId = this.followTarget?.id;
     if (!this.followMode || this.suppressedByFollow || this.stopping || this.contextMenu || !Number.isSafeInteger(hostId) || hostId <= 0) return;
@@ -921,7 +932,18 @@ export class Companion {
       const wave = this.prayerWave?.hostId === hostId ? this.prayerWave.window : null;
       const overlays = [...(wave?.isVisible() ? [wave] : []), ...this.windows.values()].filter((window) => !window.isDestroyed())
         .map((window) => window.getMediaSourceId().split(':')[1]);
-      this.delegate?.stackWindows?.(hostId, overlays, owned);
+      const follow = [];
+      const host = this.followTarget.nativeFrame;
+      if (host && !this.gesture.active && !this.contextMenu) {
+        for (const [view, window] of this.windows) {
+          if (window.isDestroyed() || (view !== 'character' && view !== 'bubble')) continue;
+          const dip = view === 'character' ? stageBounds(this.character) : (this.nativeBubbleBounds || window.getBounds());
+          const rect = screen.dipToScreenRect(window, dip);
+          follow.push({ id: Number(window.getMediaSourceId().split(':')[1]), dx: rect.x-host.x, dy: rect.y-host.y,
+            width: host.width, height: host.height });
+        }
+      }
+      if (this.delegate?.stackWindows?.(hostId, overlays, owned, follow)) this.nativeFollowHost = follow.length ? hostId : null;
       return;
     }
     const regions = [this.character, ...(this.bubbleVisible ? [this.windows.get('bubble').getBounds()] : [])];
@@ -970,6 +992,7 @@ export class Companion {
 
   // 宿主或所在屏幕不可见时先收起角色和气泡，保留用户主动隐藏的状态。
   hideForFollow() {
+    this.clearNativeFollow();
     this.suppressedByFollow = true;
     this.contextMenu?.closePopup(this.windows.get('character'));
     this.cancelGesture();
@@ -1012,11 +1035,15 @@ export class Companion {
     // 即使角色本身没有移动，工作区变化也可能需要重新摆放气泡。
     const layoutChanged = refresh || this.suppressedByFollow || RECT_KEYS.some((key) =>
       next[key] !== this.character[key] || display.workArea[key] !== this.display.workArea[key]);
+    const nativeTranslation = process.platform === 'win32' && this.nativeFollowHost === frame.id
+      && !refresh && !this.suppressedByFollow && this.display?.id === display.id
+      && next.width === this.character.width && next.height === this.character.height;
     this.display = display;
     this.suppressedByFollow = false;
     if (layoutChanged) {
       this.character = next;
-      this.applyCharacter();
+      this.nativeTranslation = nativeTranslation;
+      try { this.applyCharacter(); } finally { this.nativeTranslation = false; }
     } else if (this.updateFacing()) this.sendCharacterLayout();
     this.syncWindowStacking();
     if (this.visible && !this.suppressedByFollow && this.ready.has('character') && !this.windows.get('character').isVisible())
